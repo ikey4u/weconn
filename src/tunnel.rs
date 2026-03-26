@@ -13,7 +13,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    cli::{ForwardKind, ForwardSpec, ParsedArgs},
+    cli::{ForwardSpec, ParsedArgs},
     client::ClientHandler,
     ssh_config::{self, HostConfig},
 };
@@ -29,25 +29,11 @@ pub async fn run(args: ParsedArgs) -> Result<()> {
         args.identity.as_deref(),
     );
 
-    let local_specs: Vec<ForwardSpec> = args
-        .specs
-        .iter()
-        .filter(|s| s.kind == ForwardKind::Local)
-        .cloned()
-        .collect();
-
-    let remote_specs: Vec<ForwardSpec> = args
-        .specs
-        .iter()
-        .filter(|s| s.kind == ForwardKind::Remote)
-        .cloned()
-        .collect();
-
     // Watch channel: Some(handle) when tunnel is up, None when down
     let (handle_tx, handle_rx) = watch::channel::<Option<SharedHandle>>(None);
 
-    // Spawn one listener task per local forward rule
-    for spec in local_specs {
+    // Spawn one listener task per forward rule
+    for spec in args.specs.iter().cloned() {
         let rx = handle_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = local_forward_listener(spec, rx).await {
@@ -62,9 +48,7 @@ pub async fn run(args: ParsedArgs) -> Result<()> {
     loop {
         let started_at = Instant::now();
 
-        let result =
-            connect_and_run(&host_config, &remote_specs, &args, &handle_tx)
-                .await;
+        let result = connect_and_run(&host_config, &args, &handle_tx).await;
 
         // connect_and_run sends Some(handle) to handle_tx once the tunnel is live.
         // If it's still Some here (before we clear it), the connection was established.
@@ -111,7 +95,6 @@ pub async fn run(args: ParsedArgs) -> Result<()> {
 
 async fn connect_and_run(
     host_config: &HostConfig,
-    remote_specs: &[ForwardSpec],
     args: &ParsedArgs,
     handle_tx: &watch::Sender<Option<SharedHandle>>,
 ) -> Result<()> {
@@ -127,30 +110,13 @@ async fn connect_and_run(
         host_config.hostname, host_config.port, host_config.user
     );
 
-    let handler = ClientHandler::new(remote_specs.to_vec());
+    let handler = ClientHandler::new();
     let mut handle = russh::client::connect(ssh_config, addr, handler)
         .await
         .context("SSH TCP connect failed")?;
 
     authenticate(&mut handle, host_config, &args.password).await?;
     info!("Authenticated as {}", host_config.user);
-
-    // Request remote port forwards
-    for spec in remote_specs {
-        handle
-            .tcpip_forward(&spec.bind_host, spec.bind_port as u32)
-            .await
-            .with_context(|| {
-                format!(
-                    "tcpip-forward {}:{} rejected by server",
-                    spec.bind_host, spec.bind_port
-                )
-            })?;
-        info!(
-            "Remote forward ready: {}:{} → {}:{}",
-            spec.bind_host, spec.bind_port, spec.dest_host, spec.dest_port
-        );
-    }
 
     // Share handle with local forward tasks
     let arc_handle = Arc::new(handle);

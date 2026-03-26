@@ -1,15 +1,8 @@
 use anyhow::{Result, bail};
 use clap::Parser;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ForwardKind {
-    Local,
-    Remote,
-}
-
 #[derive(Debug, Clone)]
 pub struct ForwardSpec {
-    pub kind: ForwardKind,
     pub bind_host: String,
     pub bind_port: u16,
     pub dest_host: String,
@@ -24,29 +17,41 @@ impl ForwardSpec {
             )
         })?;
 
-        let kind = match kind_str {
-            "l" | "L" => ForwardKind::Local,
-            "r" | "R" => ForwardKind::Remote,
+        let is_remote_pull = match kind_str {
+            "l" | "L" => false,
+            "r" | "R" => true,
             _ => bail!(
                 "Invalid type '{kind_str}' in '{s}': must be 'l' (local) or 'r' (remote)"
             ),
         };
 
-        let (bind_part, dest_part) = rest
-            .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("Invalid rule '{s}': missing dest, expected l/bind:port/dest:port"))?;
+        let (first_part, second_part) =
+            rest.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("Invalid rule '{s}': missing second address")
+            })?;
 
-        let (bind_host, bind_port) =
-            parse_host_port(bind_part).map_err(|e| {
-                anyhow::anyhow!("Invalid bind address in '{s}': {e}")
+        let (first_host, first_port) =
+            parse_host_port(first_part).map_err(|e| {
+                anyhow::anyhow!("Invalid first address in '{s}': {e}")
             })?;
-        let (dest_host, dest_port) =
-            parse_host_port(dest_part).map_err(|e| {
-                anyhow::anyhow!("Invalid dest address in '{s}': {e}")
+        let (second_host, second_port) =
+            parse_host_port(second_part).map_err(|e| {
+                anyhow::anyhow!("Invalid second address in '{s}': {e}")
             })?;
+
+        // Both l/ and r/ produce SSH -L style forwarding (local listener, SSH server connects
+        // to the remote service). They differ only in argument order:
+        //   l/local_bind/remote_service  → listen locally at local_bind
+        //   r/remote_service/local_bind  → same, but remote service is listed first
+        let (bind_host, bind_port, dest_host, dest_port) = if is_remote_pull {
+            // r: first arg = remote service, second arg = local bind
+            (second_host, second_port, first_host, first_port)
+        } else {
+            // l: first arg = local bind, second arg = remote service
+            (first_host, first_port, second_host, second_port)
+        };
 
         Ok(ForwardSpec {
-            kind,
             bind_host,
             bind_port,
             dest_host,
@@ -92,14 +97,19 @@ fn normalize_host(h: &str) -> String {
     long_about = concat!(
         "weconn creates SSH tunnels that automatically reconnect on network failures.\n",
         "\n",
-        "RULES:\n",
-        "  l/bind:port/dest:port   Local: listen locally, forward to dest via SSH\n",
-        "  r/bind:port/dest:port   Remote: SSH server listens, forward to local dest\n",
+        "RULES (both are SSH -L; only argument order differs):\n",
+        "  l/local_bind/remote_service   Listen at local_bind, SSH server connects to remote_service\n",
+        "  r/remote_service/local_bind   Same effect, remote service address listed first\n",
+        "\n",
+        "ADDRESS SHORTHANDS:\n",
+        "  3306          →  127.0.0.1:3306\n",
+        "  :3306         →  127.0.0.1:3306\n",
+        "  0:3306        →  0.0.0.0:3306\n",
         "\n",
         "EXAMPLES:\n",
-        "  weconn l/127.0.0.1:3307/10.0.0.5:3306 myserver\n",
-        "  weconn r/0.0.0.0:8080/127.0.0.1:8080 myserver\n",
-        "  weconn l/3307/10.0.0.5:3306 r/0.0.0.0:8080/127.0.0.1:8080 myserver"
+        "  weconn l/3307/10.0.0.5:3306 myserver         # access remote DB locally\n",
+        "  weconn r/10.0.0.5:3306/3307 myserver         # same, remote service listed first\n",
+        "  weconn l/3307/10.0.0.5:3306 r/8080/api:80 myserver  # multiple rules"
     )
 )]
 struct Cli {
