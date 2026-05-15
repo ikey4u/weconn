@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = cli::parse()?;
-    tunnel::run(args).await
+    match cli::parse()? {
+        cli::Command::Ssh(args) => tunnel::run(args).await,
+    }
 }

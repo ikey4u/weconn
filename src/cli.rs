@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Clone)]
 pub struct ForwardSpec {
@@ -93,26 +93,42 @@ fn normalize_host(h: &str) -> String {
 #[derive(Parser)]
 #[command(
     name = "weconn",
-    about = "Stable SSH port forwarding with auto-reconnect",
-    long_about = concat!(
-        "weconn creates SSH tunnels that automatically reconnect on network failures.\n",
-        "\n",
-        "RULES (both are SSH -L; only argument order differs):\n",
-        "  l/local_bind/remote_service   Listen at local_bind, SSH server connects to remote_service\n",
-        "  r/remote_service/local_bind   Same effect, remote service address listed first\n",
-        "\n",
-        "ADDRESS SHORTHANDS:\n",
-        "  3306          →  127.0.0.1:3306\n",
-        "  :3306         →  127.0.0.1:3306\n",
-        "  0:3306        →  0.0.0.0:3306\n",
-        "\n",
-        "EXAMPLES:\n",
-        "  weconn l/3307/10.0.0.5:3306 myserver         # access remote DB locally\n",
-        "  weconn r/10.0.0.5:3306/3307 myserver         # same, remote service listed first\n",
-        "  weconn l/3307/10.0.0.5:3306 r/8080/api:80 myserver  # multiple rules"
-    )
+    about = "Stable connection tools",
+    subcommand_required = true,
+    arg_required_else_help = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    #[command(
+        about = "Stable SSH port forwarding with auto-reconnect",
+        long_about = concat!(
+            "weconn ssh creates SSH tunnels that automatically reconnect on network failures.\n",
+            "\n",
+            "RULES (both are SSH -L; only argument order differs):\n",
+            "  l/local_bind/remote_service   Listen at local_bind, SSH server connects to remote_service\n",
+            "  r/remote_service/local_bind   Same effect, remote service address listed first\n",
+            "\n",
+            "ADDRESS SHORTHANDS:\n",
+            "  3306          →  127.0.0.1:3306\n",
+            "  :3306         →  127.0.0.1:3306\n",
+            "  0:3306        →  0.0.0.0:3306\n",
+            "\n",
+            "EXAMPLES:\n",
+            "  weconn ssh l/3307/10.0.0.5:3306 myserver\n",
+            "  weconn ssh r/10.0.0.5:3306/3307 myserver\n",
+            "  weconn ssh l/3307/10.0.0.5:3306 r/8080/api:80 myserver"
+        )
+    )]
+    Ssh(SshCli),
+}
+
+#[derive(Args)]
+struct SshCli {
     /// Forward rules and SSH host (host is the last argument)
     /// e.g.: l/127.0.0.1:3307/10.0.0.5:3306  r/0.0.0.0:8080/127.0.0.1:8080  myserver
     #[arg(required = true, num_args = 2..)]
@@ -136,7 +152,12 @@ struct Cli {
 }
 
 #[derive(Debug)]
-pub struct ParsedArgs {
+pub enum Command {
+    Ssh(SshArgs),
+}
+
+#[derive(Debug)]
+pub struct SshArgs {
     pub specs: Vec<ForwardSpec>,
     pub ssh_host: String,
     pub user: Option<String>,
@@ -145,10 +166,16 @@ pub struct ParsedArgs {
     pub port: Option<u16>,
 }
 
-pub fn parse() -> Result<ParsedArgs> {
+pub fn parse() -> Result<Command> {
     let cli = Cli::parse();
-    let mut args = cli.args;
 
+    match cli.command {
+        CliCommand::Ssh(args) => parse_ssh(args).map(Command::Ssh),
+    }
+}
+
+fn parse_ssh(cli: SshCli) -> Result<SshArgs> {
+    let mut args = cli.args;
     let ssh_host = args.pop().expect("clap ensures at least 2 args");
 
     if args.is_empty() {
@@ -160,7 +187,7 @@ pub fn parse() -> Result<ParsedArgs> {
         .map(|s| ForwardSpec::parse(s))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(ParsedArgs {
+    Ok(SshArgs {
         specs,
         ssh_host,
         user: cli.user,

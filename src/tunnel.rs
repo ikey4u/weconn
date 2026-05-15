@@ -13,7 +13,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    cli::{ForwardSpec, ParsedArgs},
+    cli::{ForwardSpec, SshArgs},
     client::ClientHandler,
     ssh_config::{self, HostConfig},
 };
@@ -21,7 +21,7 @@ use crate::{
 type SshHandle = Handle<ClientHandler>;
 type SharedHandle = Arc<SshHandle>;
 
-pub async fn run(args: ParsedArgs) -> Result<()> {
+pub async fn run(args: SshArgs) -> Result<()> {
     let host_config = ssh_config::resolve(
         &args.ssh_host,
         args.port,
@@ -95,7 +95,7 @@ pub async fn run(args: ParsedArgs) -> Result<()> {
 
 async fn connect_and_run(
     host_config: &HostConfig,
-    args: &ParsedArgs,
+    args: &SshArgs,
     handle_tx: &watch::Sender<Option<SharedHandle>>,
 ) -> Result<()> {
     let ssh_config = Arc::new(russh::client::Config {
