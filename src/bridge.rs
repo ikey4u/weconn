@@ -3,7 +3,9 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional,
+    },
     net::{TcpListener, TcpStream},
     sync::{Mutex, Semaphore},
     time::timeout,
@@ -30,6 +32,9 @@ pub async fn run(args: BridgeArgs) -> Result<()> {
     let token = args.token.map(Arc::<str>::from);
 
     match (args.export, args.import) {
+        (BridgeEndpoint::Tcp(listen), BridgeEndpoint::Tcp(target)) => {
+            tcp_tcp(listen, target).await
+        }
         (BridgeEndpoint::Tcp(listen), BridgeEndpoint::Ws(target))
         | (BridgeEndpoint::Tcp(listen), BridgeEndpoint::Wss(target)) => {
             tcp_websocket(listen, target, token).await
@@ -39,6 +44,72 @@ pub async fn run(args: BridgeArgs) -> Result<()> {
         }
         _ => unreachable!("bridge args are validated by cli::parse"),
     }
+}
+
+async fn tcp_tcp(listen: TcpEndpoint, target: TcpEndpoint) -> Result<()> {
+    let listener =
+        TcpListener::bind(&listen.addr).await.with_context(|| {
+            format!("Failed to bind TCP listener {}", listen.addr)
+        })?;
+
+    info!("TCP bridge: {} → {}", listen.addr, target.addr);
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
+    loop {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Connection limiter closed")?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                drop(permit);
+                warn!("accept() error on {}: {e}", listen.addr);
+                continue;
+            }
+        };
+
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Unable to set TCP_NODELAY on client {peer_addr}: {e}");
+        }
+
+        debug!("Accepted TCP client {peer_addr}");
+        let target = target.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = handle_tcp_tcp(stream, target).await {
+                debug!("TCP bridge connection closed: {e:#}");
+            }
+        });
+    }
+}
+
+async fn handle_tcp_tcp(
+    mut stream: TcpStream,
+    target: TcpEndpoint,
+) -> Result<()> {
+    let mut backend =
+        timeout(CONNECT_TIMEOUT, TcpStream::connect(&target.addr))
+            .await
+            .context("TCP connect timed out")?
+            .with_context(|| {
+                format!("Failed to connect TCP target {}", target.addr)
+            })?;
+
+    if let Err(e) = backend.set_nodelay(true) {
+        warn!(
+            "Unable to set TCP_NODELAY on backend connection {}: {e}",
+            target.addr
+        );
+    }
+
+    copy_bidirectional(&mut stream, &mut backend)
+        .await
+        .context("TCP forwarding failed")?;
+
+    Ok(())
 }
 
 async fn tcp_websocket(

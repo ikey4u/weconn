@@ -39,9 +39,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum CliCommand {
     #[command(
-        about = "Bridge TCP streams over WebSocket",
+        about = "Bridge TCP streams directly or over WebSocket",
         long_about = concat!(
-            "weconn bridge converts TCP streams to WebSocket streams, or WebSocket streams to TCP.\n",
+            "weconn bridge forwards TCP streams directly, TCP streams to WebSocket streams, or WebSocket streams to TCP.\n",
             "\n",
             "SUPPORTED ENDPOINTS:\n",
             "  --export  tcp://host:port, ws://host:port/path, or http://host:port/path\n",
@@ -51,6 +51,7 @@ enum CliCommand {
             "NOTES:\n",
             "  --export is the local endpoint exposed by weconn\n",
             "  --import is the endpoint weconn connects to for each accepted connection\n",
+            "  tcp:// export with tcp:// import performs direct TCP forwarding\n",
             "  http:// export/import endpoints are treated as ws:// WebSocket endpoints over HTTP Upgrade\n",
             "  https:// import endpoints are treated as wss://\n",
             "  wss:// and https:// export endpoints are not supported yet\n",
@@ -59,6 +60,7 @@ enum CliCommand {
             "  --token is sent as Authorization: Bearer <token> on WebSocket import\n",
             "\n",
             "EXAMPLES:\n",
+            "  weconn bridge --export tcp://127.0.0.1:8080 --import tcp://127.0.0.1:80\n",
             "  weconn bridge --export tcp://127.0.0.1:3306 --import https://public.com:443/wss\n",
             "  weconn bridge --export tcp://127.0.0.1:3307 --import wss://public.com:443/wss\n",
             "  weconn bridge --export tcp://127.0.0.1:3307 --import ws://public.com:8080/wss\n",
@@ -195,6 +197,18 @@ fn parse_bridge(cli: BridgeCli) -> Result<BridgeArgs> {
     let import = parse_bridge_import_endpoint(&cli.import)?;
 
     match (&export, &import) {
+        (BridgeEndpoint::Tcp(_), BridgeEndpoint::Tcp(_)) => {
+            if cli.token.is_some() {
+                bail!(
+                    "--token is only supported when a WebSocket endpoint is used"
+                );
+            }
+            Ok(BridgeArgs {
+                export,
+                import,
+                token: None,
+            })
+        }
         (BridgeEndpoint::Tcp(_), BridgeEndpoint::Ws(_))
         | (BridgeEndpoint::Tcp(_), BridgeEndpoint::Wss(_))
         | (BridgeEndpoint::Ws(_), BridgeEndpoint::Tcp(_)) => Ok(BridgeArgs {
@@ -203,7 +217,7 @@ fn parse_bridge(cli: BridgeCli) -> Result<BridgeArgs> {
             token: cli.token,
         }),
         _ => bail!(
-            "bridge currently supports --export tcp://... --import ws(s)://... or --export ws/http://... --import tcp://..."
+            "bridge currently supports --export tcp://... --import tcp://..., --export tcp://... --import ws(s)://..., or --export ws/http://... --import tcp://..."
         ),
     }
 }
