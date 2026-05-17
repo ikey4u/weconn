@@ -6,6 +6,7 @@ mod cli;
 mod client;
 mod ssh_config;
 mod ssh_forward;
+mod ssh_session;
 mod tunnel;
 
 #[tokio::main]

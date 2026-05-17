@@ -55,22 +55,51 @@ enum CliCommand {
     #[command(
         about = "Stable SSH port forwarding with auto-reconnect",
         long_about = concat!(
-            "weconn ssh creates SSH tunnels that automatically reconnect on network failures.\n",
-            "Forward syntax matches OpenSSH -L and -R.\n",
+            "OpenSSH-compatible -L / -R with automatic reconnect.\n",
             "\n",
-            "FORWARD SPEC:\n",
-            "  [bind_address:]port:host:hostport\n",
-            "  IPv6 must use brackets: [::1]:3307:[::1]:3306\n",
+            "SYNTAX\n",
+            "  [bind_host:]bind_port:remote_host:remote_port\n",
             "\n",
-            "  -L  Local forward: listen on this machine, connect from the SSH server\n",
-            "  -R  Remote forward: listen on the SSH server, connect on this machine\n",
+            "  bind_host omitted     listens on 127.0.0.1 only\n",
+            "  bind_host 0.0.0.0     listens on all interfaces\n",
+            "  bind_host <IP>        listens on that address only\n",
             "\n",
-            "EXAMPLES:\n",
-            "  weconn ssh -L 3307:10.0.0.5:3306 myserver\n",
-            "  weconn ssh -L 127.0.0.1:3307:10.0.0.5:3306 myserver\n",
-            "  weconn ssh -L [::1]:3307:[2001:db8::1]:3306 myserver\n",
-            "  weconn ssh -R 8080:127.0.0.1:3000 myserver\n",
-            "  weconn ssh -L 3307:db:3306 -R 8080:127.0.0.1:3000 myserver"
+            "  -L  WHO LISTENS: your PC (bind_port)\n",
+            "      WHO CONNECTS TO TARGET: the SSH server → remote_host:remote_port\n",
+            "      (target must be reachable FROM the server, not necessarily from your PC)\n",
+            "\n",
+            "  -R  WHO LISTENS: the SSH server (bind_port)\n",
+            "      WHO CONNECTS TO TARGET: your PC → remote_host:remote_port\n",
+            "      (target must be reachable FROM your PC, e.g. 127.0.0.1 or your LAN)\n",
+            "\n",
+            "EXAMPLES\n",
+            "\n",
+            "  Local (-L), localhost only:\n",
+            "    weconn ssh -L 3307:10.0.0.5:3306 myserver\n",
+            "\n",
+            "  Local (-L), LAN clients allowed:\n",
+            "    weconn ssh -L 0.0.0.0:8080:10.0.0.5:80 myserver\n",
+            "\n",
+            "  Local (-L), one interface:\n",
+            "    weconn ssh -L 192.168.1.50:3307:10.0.0.5:3306 myserver\n",
+            "\n",
+            "  Remote (-R), server localhost only:\n",
+            "    weconn ssh -R 127.0.0.1:9000:127.0.0.1:3000 myserver\n",
+            "\n",
+            "  Remote (-R), server all interfaces → your LAN host:\n",
+            "    weconn ssh -R 0.0.0.0:9000:192.168.1.20:3000 myserver\n",
+            "\n",
+            "  Multiple -L / -R:\n",
+            "    weconn ssh -L 3307:10.0.0.5:3306 -L 6380:10.0.0.5:6379 myserver\n",
+            "\n",
+            "  ProxyJump (-J or ProxyJump in ~/.ssh/config):\n",
+            "    weconn ssh -J bastion -L 3307:mysql.internal:3306 app-server\n",
+            "    weconn ssh -J hop1,hop2 -L 3307:10.0.0.5:3306 target\n",
+            "\n",
+            "NOTES\n",
+            "  Repeat -L, -R, or -J to add more. IPv6: [::1]:3307:[::1]:3306\n",
+            "  CLI -J overrides config ProxyJump. Jump chain rebuilds on reconnect.\n",
+            "  -L ports stay open during reconnect; new clients wait up to ~120s."
         )
     )]
     Ssh(SshCli),
@@ -93,7 +122,7 @@ struct BridgeCli {
 
 #[derive(Args)]
 struct SshCli {
-    /// Local forward: [bind_address:]port:host:hostport (same as ssh -L)
+    /// Local forward (repeatable). [bind_host:]bind_port:remote_host:remote_port
     #[arg(
         short = 'L',
         long = "local-forward",
@@ -102,7 +131,7 @@ struct SshCli {
     )]
     local_forwards: Vec<String>,
 
-    /// Remote forward: [bind_address:]port:host:hostport (same as ssh -R)
+    /// Remote forward (repeatable). [bind_host:]bind_port:remote_host:remote_port
     #[arg(
         short = 'R',
         long = "remote-forward",
@@ -113,6 +142,15 @@ struct SshCli {
 
     /// SSH host or ~/.ssh/config host alias
     ssh_host: String,
+
+    /// Jump host(s), comma-separated or repeat -J. Overrides ~/.ssh/config ProxyJump
+    #[arg(
+        short = 'J',
+        long = "jump",
+        value_name = "HOST",
+        action = clap::ArgAction::Append
+    )]
+    proxy_jump: Vec<String>,
 
     /// SSH username (overrides ~/.ssh/config)
     #[arg(short, long)]
@@ -169,6 +207,7 @@ pub struct WebSocketEndpoint {
 pub struct SshArgs {
     pub forwards: Vec<SshForward>,
     pub ssh_host: String,
+    pub proxy_jump: Vec<String>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub identity: Option<String>,
@@ -369,6 +408,7 @@ fn parse_ssh(cli: SshCli) -> Result<SshArgs> {
     Ok(SshArgs {
         forwards,
         ssh_host: cli.ssh_host,
+        proxy_jump: cli.proxy_jump,
         user: cli.user,
         password: cli.password,
         identity: cli.identity,

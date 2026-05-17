@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use russh::{client::Handle, keys::PrivateKeyWithHashAlg};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -14,21 +13,30 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     cli::SshArgs,
-    client::ClientHandler,
-    ssh_config::{self, HostConfig},
+    ssh_config::{self, ResolvedTarget},
     ssh_forward::{ForwardKind, SshForward},
+    ssh_session::{self, SessionHolder},
 };
 
-type SshHandle = Handle<ClientHandler>;
-type SharedHandle = Arc<SshHandle>;
+type SharedSession = Arc<SessionHolder>;
 
 pub async fn run(args: SshArgs) -> Result<()> {
-    let host_config = ssh_config::resolve(
+    let target = ssh_config::resolve_target(
         &args.ssh_host,
         args.port,
         args.user.as_deref(),
         args.identity.as_deref(),
-    );
+        &args.proxy_jump,
+    )?;
+
+    if target.jumps.is_empty() {
+        info!(
+            "SSH target: {}:{}",
+            target.destination.hostname, target.destination.port
+        );
+    } else {
+        info!("SSH path: {}", target.path_label());
+    }
 
     let remote_forwards: Arc<Vec<SshForward>> = Arc::new(
         args.forwards
@@ -38,14 +46,15 @@ pub async fn run(args: SshArgs) -> Result<()> {
             .collect(),
     );
 
-    let (handle_tx, handle_rx) = watch::channel::<Option<SharedHandle>>(None);
+    let (session_tx, session_rx) =
+        watch::channel::<Option<SharedSession>>(None);
 
     for spec in args
         .forwards
         .iter()
         .filter(|f| f.kind == ForwardKind::Local)
     {
-        let rx = handle_rx.clone();
+        let rx = session_rx.clone();
         let spec = spec.clone();
         tokio::spawn(async move {
             if let Err(e) = local_forward_listener(spec, rx).await {
@@ -56,20 +65,26 @@ pub async fn run(args: SshArgs) -> Result<()> {
 
     let mut delay = Duration::from_secs(1);
     let mut ever_connected = false;
+    let mut attempt: u32 = 0;
 
     loop {
+        attempt += 1;
         let started_at = Instant::now();
 
+        if attempt > 1 {
+            info!("Reconnect attempt {attempt} via {}", target.path_label());
+        }
+
         let result = connect_and_run(
-            &host_config,
-            &args,
+            &target,
+            &args.password,
             Arc::clone(&remote_forwards),
-            &handle_tx,
+            &session_tx,
         )
         .await;
 
-        let was_connected = handle_tx.borrow().is_some();
-        let _ = handle_tx.send(None);
+        let was_connected = session_tx.borrow().is_some();
+        let _ = session_tx.send(None);
 
         match result {
             Ok(()) => {
@@ -78,7 +93,10 @@ pub async fn run(args: SshArgs) -> Result<()> {
             }
             Err(e) => {
                 if !was_connected && !ever_connected {
-                    return Err(e);
+                    return Err(e).context(format!(
+                        "Initial connection failed (path: {})",
+                        target.path_label()
+                    ));
                 }
 
                 ever_connected = true;
@@ -87,8 +105,10 @@ pub async fn run(args: SshArgs) -> Result<()> {
                     delay = Duration::from_secs(1);
                 }
 
-                warn!("Connection lost: {e:#}");
-                warn!("Reconnecting in {delay:.0?}...");
+                warn!("Tunnel down: {e:#}");
+                warn!(
+                    "Reconnecting in {delay:.0?} (local -L listeners stay up)..."
+                );
 
                 tokio::select! {
                     _ = sleep(delay) => {}
@@ -107,53 +127,50 @@ pub async fn run(args: SshArgs) -> Result<()> {
 }
 
 async fn connect_and_run(
-    host_config: &HostConfig,
-    args: &SshArgs,
+    target: &ResolvedTarget,
+    password: &Option<String>,
     remote_forwards: Arc<Vec<SshForward>>,
-    handle_tx: &watch::Sender<Option<SharedHandle>>,
+    session_tx: &watch::Sender<Option<SharedSession>>,
 ) -> Result<()> {
-    let ssh_config = Arc::new(russh::client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
-
-    let addr = (host_config.hostname.as_str(), host_config.port);
-    info!(
-        "Connecting to {}:{} as {}",
-        host_config.hostname, host_config.port, host_config.user
-    );
-
-    let handler = ClientHandler::new(Arc::clone(&remote_forwards));
-    let mut handle = russh::client::connect(ssh_config, addr, handler)
-        .await
-        .context("SSH TCP connect failed")?;
-
-    authenticate(&mut handle, host_config, &args.password).await?;
-    info!("Authenticated as {}", host_config.user);
+    let session = ssh_session::connect_target(
+        target,
+        password,
+        Arc::clone(&remote_forwards),
+    )
+    .await
+    .with_context(|| {
+        format!("SSH session setup failed for {}", target.path_label())
+    })?;
 
     for spec in remote_forwards.iter() {
-        let bound_port = handle
+        let bound_port = session
+            .handle
             .tcpip_forward(&spec.bind_host, spec.bind_port as u32)
             .await
             .with_context(|| {
                 format!(
-                    "Failed to request remote forward {} (listen on SSH server)",
-                    SshForward::socket_addr(&spec.bind_host, spec.bind_port)
+                    "Failed to request remote forward {} on {}",
+                    SshForward::socket_addr(&spec.bind_host, spec.bind_port),
+                    target.destination.hostname
                 )
             })?;
         info!(
-            "Remote forward: {} → {} (server listening on port {})",
+            "Remote forward (-R): {} → {} (listening on port {})",
             SshForward::socket_addr(&spec.bind_host, spec.bind_port),
             SshForward::socket_addr(&spec.dest_host, spec.dest_port),
             bound_port
         );
     }
 
-    let arc_handle = Arc::new(handle);
-    let _ = handle_tx.send(Some(Arc::clone(&arc_handle)));
+    let shared = session.into_shared();
+    let _ = session_tx.send(Some(Arc::clone(&shared)));
 
-    let ping_handle = Arc::clone(&arc_handle);
+    info!(
+        "Tunnel ready ({} hop(s)); forwards active",
+        target.hop_count()
+    );
+
+    let ping_session = Arc::clone(&shared);
     let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -163,7 +180,7 @@ async fn connect_and_run(
 
         loop {
             interval.tick().await;
-            if let Err(e) = ping_handle.send_ping().await {
+            if let Err(e) = ping_session.handle.send_ping().await {
                 let _ =
                     dead_tx.send(anyhow::anyhow!("Keepalive ping failed: {e}"));
                 break;
@@ -181,7 +198,8 @@ async fn connect_and_run(
         result = tokio::signal::ctrl_c() => {
             result.context("Failed to listen for Ctrl+C")?;
             info!("Ctrl+C received, disconnecting...");
-            let _ = arc_handle
+            let _ = shared
+                .handle
                 .disconnect(russh::Disconnect::ByApplication, "user request", "en")
                 .await;
             Ok(())
@@ -189,94 +207,9 @@ async fn connect_and_run(
     }
 }
 
-async fn authenticate(
-    handle: &mut SshHandle,
-    host_config: &HostConfig,
-    password: &Option<String>,
-) -> Result<()> {
-    let user = &host_config.user;
-
-    for key_path in &host_config.identity_files {
-        if !key_path.exists() {
-            continue;
-        }
-        debug!("Trying key: {}", key_path.display());
-
-        match russh::keys::load_secret_key(key_path, None) {
-            Ok(key) => {
-                let hash_alg = if key.algorithm().is_rsa() {
-                    match handle.best_supported_rsa_hash().await {
-                        Ok(Some(alg)) => alg,
-                        Ok(None) => {
-                            debug!("Server does not support RSA, skipping key");
-                            continue;
-                        }
-                        Err(e) => {
-                            debug!("Could not query RSA hash algorithm: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let key_with_alg =
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-                match handle.authenticate_publickey(user, key_with_alg).await {
-                    Ok(result) if result.success() => {
-                        debug!(
-                            "Authenticated with key: {}",
-                            key_path.display()
-                        );
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        debug!("Key rejected: {}", key_path.display());
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Key auth error for {}: {e}",
-                            key_path.display()
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Cannot load key {}: {e}", key_path.display());
-            }
-        }
-    }
-
-    if let Some(pwd) = password {
-        match handle.authenticate_password(user, pwd).await {
-            Ok(result) if result.success() => {
-                debug!("Authenticated with password");
-                return Ok(());
-            }
-            Ok(_) => {
-                anyhow::bail!("Password authentication rejected by server");
-            }
-            Err(e) => {
-                return Err(e).context("Password authentication failed");
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "All authentication methods failed for user '{}'. \
-         Tried {} key(s){}.",
-        user,
-        host_config.identity_files.len(),
-        if password.is_some() {
-            " and password"
-        } else {
-            ""
-        }
-    )
-}
-
 async fn local_forward_listener(
     spec: SshForward,
-    handle_rx: watch::Receiver<Option<SharedHandle>>,
+    session_rx: watch::Receiver<Option<SharedSession>>,
 ) -> Result<()> {
     let bind_addr = SshForward::socket_addr(&spec.bind_host, spec.bind_port);
     let listener = TcpListener::bind(&bind_addr)
@@ -284,7 +217,7 @@ async fn local_forward_listener(
         .with_context(|| format!("Failed to bind local address {bind_addr}"))?;
 
     info!(
-        "Local forward (-L): {} → {}",
+        "Local forward (-L): {} → {} (listener stays up across reconnects)",
         bind_addr,
         SshForward::socket_addr(&spec.dest_host, spec.dest_port)
     );
@@ -301,7 +234,7 @@ async fn local_forward_listener(
 
         let dest_host = spec.dest_host.clone();
         let dest_port = spec.dest_port;
-        let mut rx = handle_rx.clone();
+        let mut rx = session_rx.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
@@ -318,23 +251,27 @@ async fn handle_local_connection(
     mut stream: TcpStream,
     dest_host: String,
     dest_port: u16,
-    handle_rx: &mut watch::Receiver<Option<SharedHandle>>,
+    session_rx: &mut watch::Receiver<Option<SharedSession>>,
 ) -> Result<()> {
-    let handle = tokio::time::timeout(Duration::from_secs(30), async {
+    let session = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             {
-                let guard = handle_rx.borrow_and_update();
-                if let Some(h) = guard.as_ref() {
-                    return Ok::<SharedHandle, anyhow::Error>(Arc::clone(h));
+                let guard = session_rx.borrow_and_update();
+                if let Some(s) = guard.as_ref() {
+                    return Ok::<SharedSession, anyhow::Error>(Arc::clone(s));
                 }
             }
-            handle_rx.changed().await.context("Handle watcher closed")?;
+            session_rx
+                .changed()
+                .await
+                .context("Session watcher closed")?;
         }
     })
     .await
-    .context("Timeout waiting for SSH tunnel to become ready")??;
+    .context("Timeout waiting for SSH tunnel (still reconnecting?)")??;
 
-    let channel = handle
+    let channel = session
+        .handle
         .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
         .await
         .context("Failed to open direct-tcpip channel")?;
