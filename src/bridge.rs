@@ -31,7 +31,7 @@ const MAX_CONNECTIONS: usize = 1024;
 pub async fn run(args: BridgeArgs) -> Result<()> {
     let token = args.token.map(Arc::<str>::from);
 
-    match (args.export, args.import) {
+    match (args.to, args.from) {
         (BridgeEndpoint::Tcp(listen), BridgeEndpoint::Tcp(target)) => {
             tcp_tcp(listen, target).await
         }

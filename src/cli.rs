@@ -23,31 +23,26 @@ enum CliCommand {
         long_about = concat!(
             "weconn bridge forwards TCP streams directly, TCP streams to WebSocket streams, or WebSocket streams to TCP.\n",
             "\n",
+            "  --to    where clients connect (local listener)\n",
+            "  --from  upstream weconn dials for each accepted connection\n",
+            "\n",
             "SUPPORTED ENDPOINTS:\n",
-            "  --export  tcp://host:port, ws://host:port/path, or http://host:port/path\n",
-            "  --import  tcp://host:port, ws://host:port/path, wss://host:port/path, http://host:port/path, or https://host:port/path\n",
-            "  --token   optional bearer token for WebSocket export/import authorization\n",
+            "  --to    tcp://host:port, ws://host:port/path, or http://host:port/path\n",
+            "  --from  tcp://host:port, ws://host:port/path, wss://host:port/path, http://host:port/path, or https://host:port/path\n",
+            "  --token optional bearer token for WebSocket authorization\n",
             "\n",
             "NOTES:\n",
-            "  --export is the local endpoint exposed by weconn\n",
-            "  --import is the endpoint weconn connects to for each accepted connection\n",
-            "  tcp:// export with tcp:// import performs direct TCP forwarding\n",
-            "  http:// export/import endpoints are treated as ws:// WebSocket endpoints over HTTP Upgrade\n",
-            "  https:// import endpoints are treated as wss://\n",
-            "  wss:// and https:// export endpoints are not supported yet\n",
-            "  export WebSocket paths are enforced during the handshake\n",
-            "  --token is checked from Authorization: Bearer <token> or ?token=<token> on export\n",
-            "  --token is sent as Authorization: Bearer <token> on WebSocket import\n",
+            "  tcp:// on both sides = direct TCP relay\n",
+            "  http:// endpoints are treated as ws:// via HTTP Upgrade; https:// --from => wss://\n",
+            "  wss:// and https:// --to are not supported yet (no TLS server)\n",
+            "  --token on --to: checked via Authorization header or ?token= query\n",
+            "  --token on --from: sent as Authorization: Bearer <token>\n",
             "\n",
             "EXAMPLES:\n",
-            "  weconn bridge --export tcp://127.0.0.1:8080 --import tcp://127.0.0.1:80\n",
-            "  weconn bridge --export tcp://127.0.0.1:3306 --import https://public.com:443/wss\n",
-            "  weconn bridge --export tcp://127.0.0.1:3307 --import wss://public.com:443/wss\n",
-            "  weconn bridge --export tcp://127.0.0.1:3307 --import ws://public.com:8080/wss\n",
-            "  weconn bridge --export http://0.0.0.0:8080/wss --import tcp://mysql:3306\n",
-            "  weconn bridge --export ws://0.0.0.0:8080/wss --import tcp://mysql:3306\n",
-            "  weconn bridge --export http://0.0.0.0:8080/mysql --import tcp://internal.com:3306\n",
-            "  weconn bridge --export http://0.0.0.0:8080/mysql --import tcp://mysql:3306 --token secret"
+            "  weconn bridge --to tcp://0.0.0.0:8080 --from tcp://127.0.0.1:80\n",
+            "  weconn bridge --to tcp://127.0.0.1:3306 --from wss://public.com:443/wss\n",
+            "  weconn bridge --to http://0.0.0.0:8080/ws --from tcp://mysql:3306\n",
+            "  weconn bridge --to http://0.0.0.0:8080/ws --from tcp://mysql:3306 --token secret"
         )
     )]
     Bridge(BridgeCli),
@@ -107,15 +102,15 @@ enum CliCommand {
 
 #[derive(Args)]
 struct BridgeCli {
-    /// Local endpoint exported by weconn
+    /// Where clients connect (local listener)
     #[arg(long, value_name = "ENDPOINT")]
-    export: String,
+    to: String,
 
-    /// Endpoint imported by weconn for each accepted connection
+    /// Upstream endpoint dialed for each accepted connection
     #[arg(long, value_name = "ENDPOINT")]
-    import: String,
+    from: String,
 
-    /// Bearer token for WebSocket export/import authorization
+    /// Bearer token for WebSocket authorization
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
 }
@@ -177,8 +172,8 @@ pub enum Command {
 
 #[derive(Debug)]
 pub struct BridgeArgs {
-    pub export: BridgeEndpoint,
-    pub import: BridgeEndpoint,
+    pub to: BridgeEndpoint,
+    pub from: BridgeEndpoint,
     pub token: Option<String>,
 }
 
@@ -224,10 +219,10 @@ pub fn parse() -> Result<Command> {
 }
 
 fn parse_bridge(cli: BridgeCli) -> Result<BridgeArgs> {
-    let export = parse_bridge_export_endpoint(&cli.export)?;
-    let import = parse_bridge_import_endpoint(&cli.import)?;
+    let to = parse_bridge_to_endpoint(&cli.to)?;
+    let from = parse_bridge_from_endpoint(&cli.from)?;
 
-    match (&export, &import) {
+    match (&to, &from) {
         (BridgeEndpoint::Tcp(_), BridgeEndpoint::Tcp(_)) => {
             if cli.token.is_some() {
                 bail!(
@@ -235,25 +230,25 @@ fn parse_bridge(cli: BridgeCli) -> Result<BridgeArgs> {
                 );
             }
             Ok(BridgeArgs {
-                export,
-                import,
+                to,
+                from,
                 token: None,
             })
         }
         (BridgeEndpoint::Tcp(_), BridgeEndpoint::Ws(_))
         | (BridgeEndpoint::Tcp(_), BridgeEndpoint::Wss(_))
         | (BridgeEndpoint::Ws(_), BridgeEndpoint::Tcp(_)) => Ok(BridgeArgs {
-            export,
-            import,
+            to,
+            from,
             token: cli.token,
         }),
         _ => bail!(
-            "bridge currently supports --export tcp://... --import tcp://..., --export tcp://... --import ws(s)://..., or --export ws/http://... --import tcp://..."
+            "bridge currently supports --to tcp://... --from tcp://..., --to tcp://... --from ws(s)://..., or --to ws/http://... --from tcp://..."
         ),
     }
 }
 
-fn parse_bridge_export_endpoint(raw: &str) -> Result<BridgeEndpoint> {
+fn parse_bridge_to_endpoint(raw: &str) -> Result<BridgeEndpoint> {
     let url = parse_endpoint_url(raw)?;
 
     match url.scheme() {
@@ -264,15 +259,15 @@ fn parse_bridge_export_endpoint(raw: &str) -> Result<BridgeEndpoint> {
             false,
         )?)),
         "wss" | "https" => bail!(
-            "wss/https export endpoints require TLS server support and are not supported yet"
+            "wss/https --to endpoints require TLS server support and are not supported yet"
         ),
         scheme => bail!(
-            "Unsupported export endpoint scheme '{scheme}': currently supports only tcp://, ws://, and http://"
+            "Unsupported --to endpoint scheme '{scheme}': currently supports only tcp://, ws://, and http://"
         ),
     }
 }
 
-fn parse_bridge_import_endpoint(raw: &str) -> Result<BridgeEndpoint> {
+fn parse_bridge_from_endpoint(raw: &str) -> Result<BridgeEndpoint> {
     let url = parse_endpoint_url(raw)?;
 
     match url.scheme() {
@@ -288,7 +283,7 @@ fn parse_bridge_import_endpoint(raw: &str) -> Result<BridgeEndpoint> {
             true,
         )?)),
         scheme => bail!(
-            "Unsupported import endpoint scheme '{scheme}': currently supports only tcp://, ws://, wss://, http://, and https://"
+            "Unsupported --from endpoint scheme '{scheme}': currently supports only tcp://, ws://, wss://, http://, and https://"
         ),
     }
 }
@@ -334,7 +329,7 @@ fn parse_websocket_endpoint(
     validate_url_common(url.as_str(), url)?;
 
     if !allow_query && url.query().is_some() {
-        bail!("Invalid export endpoint '{}': query is not supported", url);
+        bail!("Invalid --to endpoint '{}': query is not supported", url);
     }
 
     Ok(WebSocketEndpoint {
