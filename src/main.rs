@@ -5,6 +5,7 @@ mod bridge;
 mod cli;
 mod client;
 mod ssh_config;
+mod ssh_forward;
 mod tunnel;
 
 #[tokio::main]

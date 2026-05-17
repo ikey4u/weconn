@@ -2,27 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use url::Url;
 
-#[derive(Debug, Clone)]
-pub struct ForwardSpec {
-    pub bind_host: String,
-    pub bind_port: u16,
-    pub dest_host: String,
-    pub dest_port: u16,
-}
-
-impl ForwardSpec {
-    pub fn from_tcp_endpoints(
-        export: &TcpEndpoint,
-        import: &TcpEndpoint,
-    ) -> Self {
-        Self {
-            bind_host: export.host.clone(),
-            bind_port: export.port,
-            dest_host: import.host.clone(),
-            dest_port: import.port,
-        }
-    }
-}
+use crate::ssh_forward::{ForwardKind, SshForward};
 
 #[derive(Parser)]
 #[command(
@@ -76,19 +56,21 @@ enum CliCommand {
         about = "Stable SSH port forwarding with auto-reconnect",
         long_about = concat!(
             "weconn ssh creates SSH tunnels that automatically reconnect on network failures.\n",
+            "Forward syntax matches OpenSSH -L and -R.\n",
             "\n",
-            "SUPPORTED ENDPOINTS:\n",
-            "  --export  tcp://host:port  Local TCP endpoint exposed by weconn\n",
-            "  --import  tcp://host:port  TCP endpoint reachable from the SSH server\n",
+            "FORWARD SPEC:\n",
+            "  [bind_address:]port:host:hostport\n",
+            "  IPv6 must use brackets: [::1]:3307:[::1]:3306\n",
             "\n",
-            "NOTES:\n",
-            "  Repeat --export and --import the same number of times for multiple forwards\n",
-            "  Each --export is paired with the --import at the same position\n",
+            "  -L  Local forward: listen on this machine, connect from the SSH server\n",
+            "  -R  Remote forward: listen on the SSH server, connect on this machine\n",
             "\n",
             "EXAMPLES:\n",
-            "  weconn ssh --export tcp://127.0.0.1:3307 --import tcp://10.0.0.5:3306 myserver\n",
-            "  weconn ssh --export tcp://0.0.0.0:8080 --import tcp://api:80 myserver\n",
-            "  weconn ssh --export tcp://127.0.0.1:3307 --import tcp://10.0.0.5:3306 --export tcp://127.0.0.1:8080 --import tcp://api:80 myserver"
+            "  weconn ssh -L 3307:10.0.0.5:3306 myserver\n",
+            "  weconn ssh -L 127.0.0.1:3307:10.0.0.5:3306 myserver\n",
+            "  weconn ssh -L [::1]:3307:[2001:db8::1]:3306 myserver\n",
+            "  weconn ssh -R 8080:127.0.0.1:3000 myserver\n",
+            "  weconn ssh -L 3307:db:3306 -R 8080:127.0.0.1:3000 myserver"
         )
     )]
     Ssh(SshCli),
@@ -111,13 +93,23 @@ struct BridgeCli {
 
 #[derive(Args)]
 struct SshCli {
-    /// Local TCP endpoint exposed by weconn
-    #[arg(long, value_name = "TCP_ENDPOINT", required = true)]
-    export: Vec<String>,
+    /// Local forward: [bind_address:]port:host:hostport (same as ssh -L)
+    #[arg(
+        short = 'L',
+        long = "local-forward",
+        value_name = "SPEC",
+        action = clap::ArgAction::Append
+    )]
+    local_forwards: Vec<String>,
 
-    /// TCP endpoint reachable from the SSH server
-    #[arg(long, value_name = "TCP_ENDPOINT", required = true)]
-    import: Vec<String>,
+    /// Remote forward: [bind_address:]port:host:hostport (same as ssh -R)
+    #[arg(
+        short = 'R',
+        long = "remote-forward",
+        value_name = "SPEC",
+        action = clap::ArgAction::Append
+    )]
+    remote_forwards: Vec<String>,
 
     /// SSH host or ~/.ssh/config host alias
     ssh_host: String,
@@ -175,7 +167,7 @@ pub struct WebSocketEndpoint {
 
 #[derive(Debug)]
 pub struct SshArgs {
-    pub specs: Vec<ForwardSpec>,
+    pub forwards: Vec<SshForward>,
     pub ssh_host: String,
     pub user: Option<String>,
     pub password: Option<String>,
@@ -362,42 +354,24 @@ fn url_path(url: &Url) -> String {
 }
 
 fn parse_ssh(cli: SshCli) -> Result<SshArgs> {
-    if cli.export.len() != cli.import.len() {
-        bail!(
-            "ssh requires the same number of --export and --import endpoints"
-        );
+    if cli.local_forwards.is_empty() && cli.remote_forwards.is_empty() {
+        bail!("at least one -L or -R forward is required");
     }
 
-    let specs = cli
-        .export
-        .iter()
-        .zip(cli.import.iter())
-        .map(|(export, import)| {
-            let export = parse_ssh_tcp_endpoint(export, "export")?;
-            let import = parse_ssh_tcp_endpoint(import, "import")?;
-            Ok(ForwardSpec::from_tcp_endpoints(&export, &import))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut forwards = Vec::new();
+    for spec in &cli.local_forwards {
+        forwards.push(SshForward::parse(spec, ForwardKind::Local)?);
+    }
+    for spec in &cli.remote_forwards {
+        forwards.push(SshForward::parse(spec, ForwardKind::Remote)?);
+    }
 
     Ok(SshArgs {
-        specs,
+        forwards,
         ssh_host: cli.ssh_host,
         user: cli.user,
         password: cli.password,
         identity: cli.identity,
         port: cli.port,
     })
-}
-
-fn parse_ssh_tcp_endpoint(raw: &str, name: &str) -> Result<TcpEndpoint> {
-    let url = parse_endpoint_url(raw)?;
-
-    if url.scheme() != "tcp" {
-        bail!(
-            "Unsupported ssh {name} endpoint scheme '{}': currently supports only tcp://",
-            url.scheme()
-        );
-    }
-
-    parse_tcp_endpoint(raw, &url)
 }
