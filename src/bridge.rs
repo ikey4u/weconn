@@ -8,7 +8,7 @@ use tokio::{
     },
     net::{TcpListener, TcpStream},
     sync::{Mutex, Semaphore},
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async, connect_async,
@@ -27,6 +27,8 @@ use crate::cli::{BridgeArgs, BridgeEndpoint, TcpEndpoint, WebSocketEndpoint};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 1024;
+const UPSTREAM_RETRIES: u32 = 3;
+const UPSTREAM_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn run(args: BridgeArgs) -> Result<()> {
     let token = args.token.map(Arc::<str>::from);
@@ -56,19 +58,19 @@ async fn tcp_tcp(listen: TcpEndpoint, target: TcpEndpoint) -> Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
+        let (stream, peer_addr) = match accept_or_shutdown(&listener).await? {
+            Some(pair) => pair,
+            None => {
+                info!("Bridge stopped");
+                return Ok(());
+            }
+        };
+
         let permit = permits
             .clone()
             .acquire_owned()
             .await
             .context("Connection limiter closed")?;
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                drop(permit);
-                warn!("accept() error on {}: {e}", listen.addr);
-                continue;
-            }
-        };
 
         if let Err(e) = stream.set_nodelay(true) {
             warn!("Unable to set TCP_NODELAY on client {peer_addr}: {e}");
@@ -90,13 +92,7 @@ async fn handle_tcp_tcp(
     mut stream: TcpStream,
     target: TcpEndpoint,
 ) -> Result<()> {
-    let mut backend =
-        timeout(CONNECT_TIMEOUT, TcpStream::connect(&target.addr))
-            .await
-            .context("TCP connect timed out")?
-            .with_context(|| {
-                format!("Failed to connect TCP target {}", target.addr)
-            })?;
+    let mut backend = connect_upstream_tcp(&target.addr).await?;
 
     if let Err(e) = backend.set_nodelay(true) {
         warn!(
@@ -110,6 +106,29 @@ async fn handle_tcp_tcp(
         .context("TCP forwarding failed")?;
 
     Ok(())
+}
+
+async fn connect_upstream_tcp(addr: &str) -> Result<TcpStream> {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=UPSTREAM_RETRIES {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e.into()),
+            Err(e) => last_err = Some(e.into()),
+        }
+
+        if attempt < UPSTREAM_RETRIES {
+            debug!(
+                "Upstream TCP connect to {addr} failed (attempt {attempt}/{UPSTREAM_RETRIES}), retrying..."
+            );
+            sleep(UPSTREAM_RETRY_DELAY).await;
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("upstream connect failed"))).with_context(
+        || format!("Failed to connect TCP target {addr} after {UPSTREAM_RETRIES} attempts"),
+    )
 }
 
 async fn tcp_websocket(
@@ -130,19 +149,19 @@ async fn tcp_websocket(
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
+        let (stream, peer_addr) = match accept_or_shutdown(&listener).await? {
+            Some(pair) => pair,
+            None => {
+                info!("Bridge stopped");
+                return Ok(());
+            }
+        };
+
         let permit = permits
             .clone()
             .acquire_owned()
             .await
             .context("Connection limiter closed")?;
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                drop(permit);
-                warn!("accept() error on {}: {e}", listen.addr);
-                continue;
-            }
-        };
 
         debug!("Accepted TCP client {peer_addr}");
         let target = target.clone();
@@ -177,19 +196,19 @@ async fn websocket_tcp(
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
+        let (stream, peer_addr) = match accept_or_shutdown(&listener).await? {
+            Some(pair) => pair,
+            None => {
+                info!("Bridge stopped");
+                return Ok(());
+            }
+        };
+
         let permit = permits
             .clone()
             .acquire_owned()
             .await
             .context("Connection limiter closed")?;
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                drop(permit);
-                warn!("accept() error on {}: {e}", listen.bind_addr);
-                continue;
-            }
-        };
 
         debug!("Accepted WebSocket client {peer_addr}");
         let target = target.clone();
@@ -207,23 +226,64 @@ async fn websocket_tcp(
     }
 }
 
+/// Accept the next client or exit cleanly on Ctrl+C.
+async fn accept_or_shutdown(
+    listener: &TcpListener,
+) -> Result<Option<(TcpStream, std::net::SocketAddr)>> {
+    tokio::select! {
+        result = listener.accept() => match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(e) => Err(e).context("accept() failed"),
+        },
+        _ = tokio::signal::ctrl_c() => Ok(None),
+    }
+}
+
 async fn handle_tcp_websocket(
     stream: TcpStream,
     target: WebSocketEndpoint,
     token: Option<Arc<str>>,
 ) -> Result<()> {
     let request = websocket_request(&target, token.as_deref())?;
-    let (websocket, _) = timeout(CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .context("WebSocket connect timed out")?
-        .with_context(|| {
-            format!(
-                "Failed to connect WebSocket target {}",
-                redact_url(&target.url)
-            )
-        })?;
+    let (websocket, _) =
+        connect_upstream_websocket(request, &target.url).await?;
 
     proxy_tcp_websocket(stream, websocket).await
+}
+
+async fn connect_upstream_websocket(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    url: &str,
+) -> Result<(
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=UPSTREAM_RETRIES {
+        match timeout(CONNECT_TIMEOUT, connect_async(request.clone())).await {
+            Ok(Ok(pair)) => return Ok(pair),
+            Ok(Err(e)) => last_err = Some(e.into()),
+            Err(e) => last_err = Some(e.into()),
+        }
+
+        if attempt < UPSTREAM_RETRIES {
+            debug!(
+                "Upstream WebSocket connect to {} failed (attempt {attempt}/{UPSTREAM_RETRIES}), retrying...",
+                redact_url(url)
+            );
+            sleep(UPSTREAM_RETRY_DELAY).await;
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("upstream connect failed"))).with_context(
+        || {
+            format!(
+                "Failed to connect WebSocket target {} after {UPSTREAM_RETRIES} attempts",
+                redact_url(url)
+            )
+        },
+    )
 }
 
 async fn handle_websocket_tcp(
@@ -250,21 +310,12 @@ async fn handle_websocket_tcp(
     .context("WebSocket handshake timed out")?
     .context("WebSocket handshake failed")?;
 
-    let tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect(&target.addr))
-        .await
-    {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => {
-            let mut websocket = websocket;
-            let _ = websocket.close(None).await;
-            return Err(e).with_context(|| {
-                format!("Failed to connect TCP target {}", target.addr)
-            });
-        }
+    let tcp = match connect_upstream_tcp(&target.addr).await {
+        Ok(tcp) => tcp,
         Err(e) => {
             let mut websocket = websocket;
             let _ = websocket.close(None).await;
-            return Err(e).context("TCP connect timed out");
+            return Err(e);
         }
     };
 
@@ -408,7 +459,11 @@ where
                     let _ = ws_to_tcp_writer.lock().await.close().await;
                     break;
                 }
-                Message::Text(_) | Message::Pong(_) | Message::Frame(_) => {}
+                Message::Text(text) => tcp_writer
+                    .write_all(text.as_bytes())
+                    .await
+                    .context("TCP write failed")?,
+                Message::Pong(_) | Message::Frame(_) => {}
             }
         }
 

@@ -94,6 +94,8 @@ enum CliCommand {
             "NOTES\n",
             "  Repeat -L, -R, or -J to add more. IPv6: [::1]:3307:[::1]:3306\n",
             "  CLI -J overrides config ProxyJump. Jump chain rebuilds on reconnect.\n",
+            "  -P password applies only to the final SSH host; use keys for ProxyJump hops.\n",
+            "  --strict-host-keys: refuse unknown host keys (default: accept-new).\n",
             "  -L ports stay open during reconnect; new clients wait up to ~120s."
         )
     )]
@@ -162,6 +164,10 @@ struct SshCli {
     /// SSH port (overrides ~/.ssh/config)
     #[arg(short = 'p', long)]
     pub port: Option<u16>,
+
+    /// Reject unknown host keys instead of adding them to ~/.ssh/known_hosts
+    #[arg(long)]
+    strict_host_keys: bool,
 }
 
 #[derive(Debug)]
@@ -207,6 +213,7 @@ pub struct SshArgs {
     pub password: Option<String>,
     pub identity: Option<String>,
     pub port: Option<u16>,
+    pub strict_host_keys: bool,
 }
 
 pub fn parse() -> Result<Command> {
@@ -393,11 +400,32 @@ fn parse_ssh(cli: SshCli) -> Result<SshArgs> {
     }
 
     let mut forwards = Vec::new();
+    let mut seen_local = std::collections::HashSet::<(String, u16)>::new();
+    let mut seen_remote = std::collections::HashSet::<(String, u16)>::new();
+
     for spec in &cli.local_forwards {
-        forwards.push(SshForward::parse(spec, ForwardKind::Local)?);
+        let fwd = SshForward::parse(spec, ForwardKind::Local)?;
+        let key = (fwd.bind_host.clone(), fwd.bind_port);
+        if !seen_local.insert(key) {
+            bail!(
+                "duplicate local forward (-L) bind address {}",
+                SshForward::socket_addr(&fwd.bind_host, fwd.bind_port)
+            );
+        }
+        forwards.push(fwd);
     }
     for spec in &cli.remote_forwards {
-        forwards.push(SshForward::parse(spec, ForwardKind::Remote)?);
+        let fwd = SshForward::parse(spec, ForwardKind::Remote)?;
+        if fwd.bind_port != 0 {
+            let key = (fwd.bind_host.clone(), fwd.bind_port);
+            if !seen_remote.insert(key) {
+                bail!(
+                    "duplicate remote forward (-R) bind address {}",
+                    SshForward::socket_addr(&fwd.bind_host, fwd.bind_port)
+                );
+            }
+        }
+        forwards.push(fwd);
     }
 
     Ok(SshArgs {
@@ -408,5 +436,6 @@ fn parse_ssh(cli: SshCli) -> Result<SshArgs> {
         password: cli.password,
         identity: cli.identity,
         port: cli.port,
+        strict_host_keys: cli.strict_host_keys,
     })
 }

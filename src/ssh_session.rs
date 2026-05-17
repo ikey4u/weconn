@@ -5,9 +5,8 @@ use russh::{client::Handle, keys::PrivateKeyWithHashAlg};
 use tracing::{debug, info};
 
 use crate::{
-    client::ClientHandler,
+    client::{ClientHandler, RemoteForwardEntry},
     ssh_config::{HostConfig, ResolvedTarget},
-    ssh_forward::SshForward,
 };
 
 type SshHandle = Handle<ClientHandler>;
@@ -15,6 +14,8 @@ type SshHandle = Handle<ClientHandler>;
 /// Final SSH session plus intermediate hop sessions that must stay alive.
 pub struct SessionHolder {
     pub handle: Arc<SshHandle>,
+    /// Monotonic id; changes on every successful reconnect.
+    pub generation: u64,
     /// Intermediate hop handles; must be held while `handle` is active.
     #[allow(dead_code)]
     chain: Vec<Arc<SshHandle>>,
@@ -26,10 +27,18 @@ impl SessionHolder {
     }
 }
 
+static SESSION_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn connect_target(
     target: &ResolvedTarget,
     password: &Option<String>,
-    remote_forwards: Arc<Vec<SshForward>>,
+    strict_host_keys: bool,
+    remote_forwards: Arc<Vec<RemoteForwardEntry>>,
 ) -> Result<SessionHolder> {
     let ssh_config = default_client_config();
 
@@ -38,6 +47,8 @@ pub async fn connect_target(
             &ssh_config,
             &target.destination,
             password,
+            true,
+            strict_host_keys,
             remote_forwards,
         )
         .await;
@@ -50,6 +61,8 @@ pub async fn connect_target(
         &ssh_config,
         &target.jumps[0],
         password,
+        false,
+        strict_host_keys,
         empty_forwards(),
     )
     .await?;
@@ -61,6 +74,8 @@ pub async fn connect_target(
             &current.handle,
             next,
             password,
+            false,
+            strict_host_keys,
             empty_forwards(),
             &format!("ProxyJump to {}", next.hostname),
         )
@@ -73,6 +88,8 @@ pub async fn connect_target(
         &current.handle,
         &target.destination,
         password,
+        true,
+        strict_host_keys,
         remote_forwards,
         &format!("target {}", target.destination.hostname),
     )
@@ -80,6 +97,7 @@ pub async fn connect_target(
 
     Ok(SessionHolder {
         handle: final_session.handle,
+        generation: final_session.generation,
         chain,
     })
 }
@@ -88,14 +106,21 @@ async fn connect_direct(
     ssh_config: &Arc<russh::client::Config>,
     host: &HostConfig,
     password: &Option<String>,
-    remote_forwards: Arc<Vec<SshForward>>,
+    allow_password: bool,
+    strict_host_keys: bool,
+    remote_forwards: Arc<Vec<RemoteForwardEntry>>,
 ) -> Result<SessionHolder> {
     info!(
         "Connecting to {}:{} as {}",
         host.hostname, host.port, host.user
     );
 
-    let handler = ClientHandler::new(remote_forwards);
+    let handler = ClientHandler::new(
+        host.hostname.clone(),
+        host.port,
+        strict_host_keys,
+        remote_forwards,
+    );
     let mut handle = russh::client::connect(
         Arc::clone(ssh_config),
         (host.hostname.as_str(), host.port),
@@ -106,11 +131,12 @@ async fn connect_direct(
         format!("SSH TCP connect failed for {}:{}", host.hostname, host.port)
     })?;
 
-    authenticate(&mut handle, host, password).await?;
+    authenticate(&mut handle, host, password, allow_password).await?;
     info!("Authenticated to {} as {}", host.hostname, host.user);
 
     Ok(SessionHolder {
         handle: Arc::new(handle),
+        generation: next_generation(),
         chain: Vec::new(),
     })
 }
@@ -120,7 +146,9 @@ async fn connect_via_channel(
     via: &Arc<SshHandle>,
     host: &HostConfig,
     password: &Option<String>,
-    remote_forwards: Arc<Vec<SshForward>>,
+    allow_password: bool,
+    strict_host_keys: bool,
+    remote_forwards: Arc<Vec<RemoteForwardEntry>>,
     label: &str,
 ) -> Result<SessionHolder> {
     info!(
@@ -144,7 +172,12 @@ async fn connect_via_channel(
         })?;
 
     let stream = channel.into_stream();
-    let handler = ClientHandler::new(remote_forwards);
+    let handler = ClientHandler::new(
+        host.hostname.clone(),
+        host.port,
+        strict_host_keys,
+        remote_forwards,
+    );
     let mut handle =
         russh::client::connect_stream(Arc::clone(ssh_config), stream, handler)
             .await
@@ -152,7 +185,7 @@ async fn connect_via_channel(
                 format!("SSH handshake over tunnel failed ({label})")
             })?;
 
-    authenticate(&mut handle, host, password).await?;
+    authenticate(&mut handle, host, password, allow_password).await?;
     info!(
         "Authenticated to {} as {user} ({label})",
         host.hostname,
@@ -161,6 +194,7 @@ async fn connect_via_channel(
 
     Ok(SessionHolder {
         handle: Arc::new(handle),
+        generation: next_generation(),
         chain: Vec::new(),
     })
 }
@@ -169,6 +203,7 @@ pub async fn authenticate(
     handle: &mut SshHandle,
     host_config: &HostConfig,
     password: &Option<String>,
+    allow_password: bool,
 ) -> Result<()> {
     let user = &host_config.user;
 
@@ -222,25 +257,27 @@ pub async fn authenticate(
         }
     }
 
-    if let Some(pwd) = password {
-        match handle.authenticate_password(user, pwd).await {
-            Ok(result) if result.success() => {
-                debug!("Authenticated with password");
-                return Ok(());
-            }
-            Ok(_) => {
-                anyhow::bail!(
-                    "Password authentication rejected by server ({})",
-                    host_config.hostname
-                );
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Password authentication failed for {}",
+    if allow_password {
+        if let Some(pwd) = password {
+            match handle.authenticate_password(user, pwd).await {
+                Ok(result) if result.success() => {
+                    debug!("Authenticated with password");
+                    return Ok(());
+                }
+                Ok(_) => {
+                    anyhow::bail!(
+                        "Password authentication rejected by server ({})",
                         host_config.hostname
-                    )
-                });
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Password authentication failed for {}",
+                            host_config.hostname
+                        )
+                    });
+                }
             }
         }
     }
@@ -251,8 +288,10 @@ pub async fn authenticate(
         user,
         host_config.hostname,
         host_config.identity_files.len(),
-        if password.is_some() {
+        if allow_password && password.is_some() {
             " and password"
+        } else if password.is_some() {
+            " (-P applies only to the final SSH host, not ProxyJump hops; use keys for jumps)"
         } else {
             ""
         }
@@ -260,13 +299,10 @@ pub async fn authenticate(
 }
 
 fn default_client_config() -> Arc<russh::client::Config> {
-    Arc::new(russh::client::Config {
-        keepalive_interval: Some(std::time::Duration::from_secs(15)),
-        keepalive_max: 3,
-        ..Default::default()
-    })
+    // Keepalive is handled by the explicit ping loop in tunnel.rs.
+    Arc::new(russh::client::Config::default())
 }
 
-fn empty_forwards() -> Arc<Vec<SshForward>> {
+fn empty_forwards() -> Arc<Vec<RemoteForwardEntry>> {
     Arc::new(Vec::new())
 }
